@@ -1,174 +1,166 @@
-from django.shortcuts import get_object_or_404
+from math import isclose
+from django.db import transaction
 from django.utils import timezone
-from django.db.models import Exists, OuterRef
-from django.contrib.auth import get_user_model
-
+from django.shortcuts import get_object_or_404
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-
-from evaluations.models import (
-    EmployeeQuestionnaire,
-    EmployeeQuestionnaireStageSubmission,
-    EmployeeQuestionnaireResponse,
+from rest_framework.exceptions import ValidationError
+from evaluations.models import EmployeeQuestionnaire
+from .models import (
+    EmployeePerformanceScore, EmployeePastPerformanceIndex,
+    EmployeePotentialAssessment, EmployeeAnalyticsRelease
 )
-
-from .models import EmployeePerformanceScore
 from .serializers import (
-    EmployeePerformanceScoreSerializer,
-    HRScoreOverrideSerializer,
-    ReleaseScoreSerializer,
+    EmployeePerformanceScoreSerializer, HRScoreOverrideSerializer,
+    ReleaseScoreSerializer
 )
-from .services import (
-    get_active_config,
-    weighted_category_score,
-    calculate_evaluator_score,
-    normalize_weights,
-    calculate_final_score,
-)
-
-from .models import EmployeePastPerformanceIndex
-from .models import EmployeePerformanceScore, EmployeePotentialAssessment
+from .services import get_active_config, calculate_questionnaire_scores
 from .services_ppi import get_past_scores, save_ppi
-
-User = get_user_model()
 
 
 def is_scoring_admin(user):
     return str(getattr(user, "employee_number", "")) == "100607"
 
 
+def _same(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    return isclose(float(a), float(b), rel_tol=0, abs_tol=0.011)
+
+
+def _calculation(questionnaire):
+    config = get_active_config()
+    if not config:
+        raise ValidationError({"error": "No active scoring configuration found."})
+    try:
+        return calculate_questionnaire_scores(questionnaire, config)
+    except DjangoValidationError as exc:
+        raise ValidationError({"error": exc.messages})
+
+
+def _current_score(questionnaire, score):
+    if not score or score.system_final_score is None:
+        return False
+
+    result = _calculation(questionnaire)
+    if not result["is_complete"]:
+        return False
+
+    if not _same(score.system_final_score, result["system_final_score"]):
+        return False
+
+    if score.descriptive_scoring_applied != result["descriptive_scoring_applied"]:
+        return False
+
+    if not _same(score.objective_final_score, result["objective_final_score"]):
+        return False
+
+    if not _same(score.descriptive_final_score, result["descriptive_final_score"]):
+        return False
+
+    expected = (
+        score.hr_override_score
+        if score.hr_override_score is not None
+        else score.system_final_score
+    )
+    return _same(score.final_effective_score, expected)
+
+
+def _category_score(result, evaluator, category):
+    objective = result["category_scores"].get(f"{evaluator}_{category}_objective")
+    descriptive = result["category_scores"].get(f"{evaluator}_{category}_descriptive")
+    ow = result["effective_objective_component_weight"]
+    dw = result["effective_descriptive_component_weight"]
+
+    if ow > 0 and objective is None:
+        return None
+    if dw > 0 and descriptive is None:
+        return None
+
+    return round((objective or 0) * ow + (descriptive or 0) * dw, 2)
+
+
+def _invalidate_analytics(questionnaire):
+    EmployeeAnalyticsRelease.objects.filter(
+        employee_questionnaire=questionnaire
+    ).update(
+        is_released_to_employee=False,
+        released_at=None,
+        released_by=None
+    )
+
+
 class AdminScoringQuestionnaireListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        if str(getattr(request.user, "employee_number", "")) != "100607":
+        if not is_scoring_admin(request.user):
             return Response({"error": "Not authorized."}, status=403)
 
-        score_subquery = EmployeePerformanceScore.objects.filter(
-            employee_questionnaire=OuterRef("pk")
-        )
+        questionnaires = EmployeeQuestionnaire.objects.select_related(
+            "employee", "review_cycle"
+        ).order_by("-id")
 
-        assessment_subquery = EmployeePotentialAssessment.objects.filter(
-            employee_questionnaire=OuterRef("pk")
-        )
+        data = []
 
-        questionnaires = (
-            EmployeeQuestionnaire.objects.select_related("employee", "review_cycle")
-            .annotate(
-                has_score=Exists(score_subquery),
-                has_potential_assessment=Exists(assessment_subquery),
-            )
-            .order_by("-id")
-        )
+        for questionnaire in questionnaires:
+            score = EmployeePerformanceScore.objects.filter(
+                employee_questionnaire=questionnaire
+            ).first()
 
-        assessment_map = {
-            item.employee_questionnaire_id: item.id
-            for item in EmployeePotentialAssessment.objects.filter(
-                employee_questionnaire_id__in=[q.id for q in questionnaires]
-            )
-        }
+            potential = EmployeePotentialAssessment.objects.filter(
+                employee_questionnaire=questionnaire
+            ).first()
 
-        results = []
-        for q in questionnaires:
-            results.append({
-                "questionnaire_id": q.id,
-                "assessment_id": assessment_map.get(q.id),
-                "employee_name": q.employee.full_name,
-                "employee_number": q.employee.employee_number,
-                "department": q.employee.department,
-                "cycle": q.review_cycle.name if q.review_cycle else None,
-                "status": q.status,
-                "has_score": q.has_score,
+            data.append({
+                "questionnaire_id": questionnaire.id,
+                "employee_id": questionnaire.employee_id,
+                "employee_name": questionnaire.employee.full_name,
+                "employee_number": questionnaire.employee.employee_number,
+                "department": questionnaire.employee.department,
+                "review_cycle": questionnaire.review_cycle.name,
+                "status": questionnaire.status,
+                "has_score": bool(score),
+                "system_final_score": score.system_final_score if score else None,
+                "final_effective_score": score.final_effective_score if score else None,
+                "is_released_to_employee": score.is_released_to_employee if score else False,
+                "has_potential_assessment": bool(potential),
+                "assessment_id": potential.id if potential else None
             })
 
-        return Response({"results": results})
+        return Response(data)
+
 
 class CalculateScoreView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request, questionnaire_id):
         if not is_scoring_admin(request.user):
-            return Response(
-                {"error": "You are not authorized to calculate scores."},
-                status=403
-            )
+            return Response({"error": "Not authorized."}, status=403)
 
+        # FIX: Lock only the EmployeeQuestionnaire row.
+        # Nullable reporting_manager joins must not be locked.
         questionnaire = get_object_or_404(
-            EmployeeQuestionnaire,
+            EmployeeQuestionnaire.objects.select_related(
+                "employee",
+                "employee__reporting_manager",
+                "review_cycle"
+            ).select_for_update(of=("self",)),
             id=questionnaire_id
         )
 
-        config = get_active_config()
+        result = _calculation(questionnaire)
 
-        if not config:
-            return Response(
-                {"error": "No active scoring configuration found."},
-                status=400
-            )
+        if not result["is_complete"]:
+            return Response({
+                "error": "Performance scoring is incomplete.",
+                "missing_requirements": result["missing_requirements"]
+            }, status=400)
 
-        submissions = EmployeeQuestionnaireStageSubmission.objects.filter(
-            employee_questionnaire=questionnaire,
-            status="submitted"
-        )
-
-        evaluator_scores = {}
-        category_scores = {}
-        active_evaluators = []
-
-        for submission in submissions:
-            evaluator = submission.evaluator_type
-
-            if evaluator not in ["self", "rm", "skip", "peer"]:
-                continue
-
-            responses = EmployeeQuestionnaireResponse.objects.filter(
-                submission=submission
-            ).select_related(
-                "questionnaire_item",
-                "questionnaire_item__parameter__category"
-            )
-
-            behavioural_responses = []
-            performance_responses = []
-
-            for r in responses:
-                category = getattr(r.questionnaire_item.parameter, "category", None)
-                category_type = str(getattr(category, "category_type", "")).strip().lower()
-
-                if category_type in ["behavioral", "behavioural"]:
-                    behavioural_responses.append(r)
-
-                if category_type == "performance":
-                    performance_responses.append(r)
-
-            behavioural_score = weighted_category_score(behavioural_responses)
-            performance_score = weighted_category_score(performance_responses)
-
-            category_scores[f"{evaluator}_behavioural"] = behavioural_score
-            category_scores[f"{evaluator}_performance"] = performance_score
-
-            evaluator_score = calculate_evaluator_score(
-                behavioural_score,
-                performance_score,
-                config
-            )
-
-            evaluator_scores[evaluator] = evaluator_score
-
-            if evaluator_score is not None:
-                active_evaluators.append(evaluator)
-
-        if not active_evaluators:
-            return Response(
-                {"error": "No valid submitted evaluator scores found for calculation."},
-                status=400
-            )
-
-        normalized_weights = normalize_weights(active_evaluators, config)
-        final_score = calculate_final_score(evaluator_scores, normalized_weights)
-
-        score_obj, _ = EmployeePerformanceScore.objects.get_or_create(
+        score, _ = EmployeePerformanceScore.objects.select_for_update().get_or_create(
             employee_questionnaire=questionnaire,
             defaults={
                 "employee": questionnaire.employee,
@@ -176,39 +168,66 @@ class CalculateScoreView(APIView):
             }
         )
 
-        score_obj.self_behavioural_score = category_scores.get("self_behavioural")
-        score_obj.self_performance_score = category_scores.get("self_performance")
+        old_system = score.system_final_score
+        old_effective = score.final_effective_score
 
-        score_obj.rm_behavioural_score = category_scores.get("rm_behavioural")
-        score_obj.rm_performance_score = category_scores.get("rm_performance")
+        score.employee = questionnaire.employee
+        score.review_cycle = questionnaire.review_cycle
 
-        score_obj.skip_behavioural_score = category_scores.get("skip_behavioural")
-        score_obj.skip_performance_score = category_scores.get("skip_performance")
+        for evaluator in ("self", "rm", "skip", "peer"):
+            setattr(
+                score,
+                f"{evaluator}_behavioural_score",
+                _category_score(result, evaluator, "behavioural")
+            )
+            setattr(
+                score,
+                f"{evaluator}_performance_score",
+                _category_score(result, evaluator, "performance")
+            )
+            setattr(
+                score,
+                f"{evaluator}_score",
+                result["evaluator_scores"].get(evaluator)
+            )
 
-        score_obj.peer_behavioural_score = category_scores.get("peer_behavioural")
-        score_obj.peer_performance_score = category_scores.get("peer_performance")
+        weights = result["effective_weights"]
+        effective = next(iter(weights.values()), {})
 
-        score_obj.self_score = evaluator_scores.get("self")
-        score_obj.rm_score = evaluator_scores.get("rm")
-        score_obj.skip_score = evaluator_scores.get("skip")
-        score_obj.peer_score = evaluator_scores.get("peer")
+        for evaluator in ("self", "rm", "skip", "peer"):
+            setattr(
+                score,
+                f"effective_{evaluator}_weight",
+                effective.get(evaluator, 0)
+            )
 
-        score_obj.effective_self_weight = normalized_weights.get("self")
-        score_obj.effective_rm_weight = normalized_weights.get("rm")
-        score_obj.effective_skip_weight = normalized_weights.get("skip")
-        score_obj.effective_peer_weight = normalized_weights.get("peer")
+        score.objective_final_score = result["objective_final_score"]
+        score.descriptive_final_score = result["descriptive_final_score"]
+        score.descriptive_scoring_applied = result["descriptive_scoring_applied"]
+        score.effective_objective_component_weight = result["effective_objective_component_weight"]
+        score.effective_descriptive_component_weight = result["effective_descriptive_component_weight"]
+        score.system_final_score = result["system_final_score"]
 
-        score_obj.system_final_score = final_score
+        score.final_effective_score = (
+            score.hr_override_score
+            if score.hr_override_score is not None
+            else score.system_final_score
+        )
 
-        if score_obj.hr_override_score is not None:
-            score_obj.final_effective_score = score_obj.hr_override_score
-        else:
-            score_obj.final_effective_score = final_score
+        changed = (
+            not _same(old_system, score.system_final_score)
+            or not _same(old_effective, score.final_effective_score)
+        )
 
-        score_obj.save()
+        if changed:
+            score.is_released_to_employee = False
+            score.released_by = None
+            score.released_at = None
+            _invalidate_analytics(questionnaire)
 
-        serializer = EmployeePerformanceScoreSerializer(score_obj)
-        return Response(serializer.data)
+        score.save()
+
+        return Response(EmployeePerformanceScoreSerializer(score).data)
 
 
 class ScoreResultView(APIView):
@@ -216,186 +235,180 @@ class ScoreResultView(APIView):
 
     def get(self, request, questionnaire_id):
         if not is_scoring_admin(request.user):
-            return Response(
-                {"error": "You are not authorized to view full score results."},
-                status=403
-            )
-
-        questionnaire = get_object_or_404(
-            EmployeeQuestionnaire,
-            id=questionnaire_id
-        )
+            return Response({"error": "Not authorized."}, status=403)
 
         score = get_object_or_404(
             EmployeePerformanceScore,
-            employee_questionnaire=questionnaire
+            employee_questionnaire_id=questionnaire_id
         )
 
-        serializer = EmployeePerformanceScoreSerializer(score)
-        return Response(serializer.data)
+        return Response(EmployeePerformanceScoreSerializer(score).data)
 
 
 class HRScoreOverrideView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @transaction.atomic
     def put(self, request, questionnaire_id):
         if not is_scoring_admin(request.user):
-            return Response(
-                {"error": "You are not authorized to override scores."},
-                status=403
-            )
+            return Response({"error": "Not authorized."}, status=403)
 
-        questionnaire = get_object_or_404(
-            EmployeeQuestionnaire,
-            id=questionnaire_id
-        )
-
+        # FIX: Lock only EmployeePerformanceScore, not nullable joins.
         score = get_object_or_404(
-            EmployeePerformanceScore,
-            employee_questionnaire=questionnaire
+            EmployeePerformanceScore.objects.select_related(
+                "employee_questionnaire__employee__reporting_manager"
+            ).select_for_update(of=("self",)),
+            employee_questionnaire_id=questionnaire_id
         )
+
+        if not _current_score(score.employee_questionnaire, score):
+            return Response({
+                "error": "Performance score is incomplete or outdated. Recalculate it first."
+            }, status=409)
 
         serializer = HRScoreOverrideSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        score.hr_override_score = round(serializer.validated_data["hr_override_score"], 2)
-        score.override_reason = serializer.validated_data["override_reason"]
+        override = serializer.validated_data["hr_override_score"]
+        reason = serializer.validated_data["override_reason"].strip()
+
+        if not 0 <= override <= 10:
+            return Response({
+                "error": "Override score must be between 0 and 10."
+            }, status=400)
+
+        if not reason:
+            return Response({"error": "Override reason is required."}, status=400)
+
+        override = round(override, 2)
+        changed = not _same(score.hr_override_score, override)
+
+        score.hr_override_score = override
+        score.final_effective_score = override
+        score.override_reason = reason
         score.overridden_by = request.user
         score.overridden_at = timezone.now()
-        score.final_effective_score = score.hr_override_score
+
+        if changed:
+            score.is_released_to_employee = False
+            score.released_by = None
+            score.released_at = None
+            _invalidate_analytics(score.employee_questionnaire)
+
         score.save()
 
-        return Response({
-            "message": "Score override applied successfully.",
-            "final_effective_score": score.final_effective_score,
-            "hr_override_score": score.hr_override_score,
-            "override_reason": score.override_reason,
-        })
+        return Response(EmployeePerformanceScoreSerializer(score).data)
 
 
 class ReleaseScoreView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @transaction.atomic
     def put(self, request, questionnaire_id):
         if not is_scoring_admin(request.user):
-            return Response(
-                {"error": "You are not authorized to release scores."},
-                status=403
-            )
+            return Response({"error": "Not authorized."}, status=403)
 
-        questionnaire = get_object_or_404(
-            EmployeeQuestionnaire,
-            id=questionnaire_id
-        )
-
+        # FIX: Avoid PostgreSQL FOR UPDATE on nullable reporting_manager join.
         score = get_object_or_404(
-            EmployeePerformanceScore,
-            employee_questionnaire=questionnaire
+            EmployeePerformanceScore.objects.select_related(
+                "employee_questionnaire__employee__reporting_manager"
+            ).select_for_update(of=("self",)),
+            employee_questionnaire_id=questionnaire_id
         )
 
         serializer = ReleaseScoreSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        release = serializer.validated_data["is_released_to_employee"]
 
-        is_released = serializer.validated_data["is_released_to_employee"]
+        if release and not _current_score(score.employee_questionnaire, score):
+            return Response({
+                "error": "Score cannot be released because its calculation is incomplete or outdated."
+            }, status=409)
 
-        score.is_released_to_employee = is_released
+        score.is_released_to_employee = release
+        score.released_by = request.user if release else None
+        score.released_at = timezone.now() if release else None
 
-        if is_released:
-            score.released_by = request.user
-            score.released_at = timezone.now()
-        else:
-            score.released_by = None
-            score.released_at = None
+        score.save(update_fields=[
+            "is_released_to_employee",
+            "released_by",
+            "released_at",
+            "calculated_at"
+        ])
 
-        score.save()
-
-        return Response({
-            "message": "Score release status updated successfully.",
-            "is_released_to_employee": score.is_released_to_employee,
-            "released_at": score.released_at,
-        })
+        return Response(EmployeePerformanceScoreSerializer(score).data)
 
 
 class MyScoreView(APIView):
     permission_classes = [IsAuthenticated]
 
-    def get(self, request, questionnaire_id):
-        questionnaire = get_object_or_404(
-            EmployeeQuestionnaire,
-            id=questionnaire_id,
-            employee=request.user
-        )
+    def get(self, request):
+        score = EmployeePerformanceScore.objects.filter(
+            employee=request.user,
+            is_released_to_employee=True
+        ).select_related(
+            "employee_questionnaire__employee__reporting_manager",
+            "review_cycle"
+        ).order_by("-review_cycle_id", "-id").first()
 
-        score = get_object_or_404(
-            EmployeePerformanceScore,
-            employee_questionnaire=questionnaire
-        )
+        if not score:
+            return Response({
+                "message": "Your score has not been released yet."
+            }, status=403)
 
-        if not score.is_released_to_employee:
-            return Response(
-                {"message": "Your score has not been released yet."},
-                status=403
-            )
+        if not _current_score(score.employee_questionnaire, score):
+            return Response({
+                "error": "Your score is temporarily unavailable because it requires recalculation."
+            }, status=409)
 
         return Response({
-            "questionnaire_id": questionnaire.id,
-            "employee_name": questionnaire.employee.full_name,
-            "review_cycle": questionnaire.review_cycle.name if questionnaire.review_cycle else None,
-            "final_effective_score": score.final_effective_score,
             "system_final_score": score.system_final_score,
-            "is_released_to_employee": score.is_released_to_employee,
+            "final_effective_score": score.final_effective_score,
             "potential_score": score.potential_score,
-            "nine_box_label": score.nine_box_label,
+            "nine_box_label": score.nine_box_label
         })
+
 
 class CalculatePPIView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request, questionnaire_id):
         if not is_scoring_admin(request.user):
-            return Response(
-                {"error": "You are not authorized to calculate PPI."},
-                status=403
-            )
+            return Response({"error": "Not authorized."}, status=403)
 
-        questionnaire = get_object_or_404(
-            EmployeeQuestionnaire,
-            id=questionnaire_id
+        score = get_object_or_404(
+            EmployeePerformanceScore.objects.select_related(
+                "employee_questionnaire__employee__reporting_manager",
+                "review_cycle",
+                "employee"
+            ),
+            employee_questionnaire_id=questionnaire_id
         )
 
-        score_obj = get_object_or_404(
-            EmployeePerformanceScore,
-            employee_questionnaire=questionnaire
+        if not _current_score(score.employee_questionnaire, score):
+            return Response({
+                "error": "Recalculate the current performance score before calculating PPI."
+            }, status=409)
+
+        past_scores = get_past_scores(score.employee, score.review_cycle)
+
+        ppi = save_ppi(
+            score.employee,
+            score.review_cycle,
+            score.final_effective_score,
+            past_scores
         )
 
-        current_score = score_obj.final_effective_score
-
-        if current_score is None:
-            return Response(
-                {"error": "Final effective score is not available for this questionnaire."},
-                status=400
-            )
-
-        past_scores = get_past_scores(
-            employee=questionnaire.employee,
-            current_cycle=questionnaire.review_cycle
-        )
-
-        ppi_obj = save_ppi(
-            employee=questionnaire.employee,
-            cycle=questionnaire.review_cycle,
-            current_score=current_score,
-            past_scores=past_scores
-        )
+        _invalidate_analytics(score.employee_questionnaire)
 
         return Response({
-            "message": "PPI calculated successfully.",
-            "employee_name": questionnaire.employee.full_name,
-            "review_cycle": questionnaire.review_cycle.name if questionnaire.review_cycle else None,
-            "current_cycle_score": ppi_obj.current_cycle_score,
-            "previous_cycle_score_1": ppi_obj.previous_cycle_score_1,
-            "previous_cycle_score_2": ppi_obj.previous_cycle_score_2,
-            "ppi_score": ppi_obj.ppi_score,
+            "employee_id": score.employee_id,
+            "review_cycle_id": score.review_cycle_id,
+            "current_cycle_score": ppi.current_cycle_score,
+            "previous_cycle_score_1": ppi.previous_cycle_score_1,
+            "previous_cycle_score_2": ppi.previous_cycle_score_2,
+            "ppi_score": ppi.ppi_score
         })
 
 
@@ -404,29 +417,24 @@ class PPIResultView(APIView):
 
     def get(self, request, questionnaire_id):
         if not is_scoring_admin(request.user):
-            return Response(
-                {"error": "You are not authorized to view PPI results."},
-                status=403
-            )
+            return Response({"error": "Not authorized."}, status=403)
 
         questionnaire = get_object_or_404(
             EmployeeQuestionnaire,
             id=questionnaire_id
         )
 
-        ppi_obj = get_object_or_404(
+        ppi = get_object_or_404(
             EmployeePastPerformanceIndex,
             employee=questionnaire.employee,
             review_cycle=questionnaire.review_cycle
         )
 
         return Response({
-            "employee_name": questionnaire.employee.full_name,
-            "employee_number": questionnaire.employee.employee_number,
-            "review_cycle": questionnaire.review_cycle.name if questionnaire.review_cycle else None,
-            "current_cycle_score": ppi_obj.current_cycle_score,
-            "previous_cycle_score_1": ppi_obj.previous_cycle_score_1,
-            "previous_cycle_score_2": ppi_obj.previous_cycle_score_2,
-            "ppi_score": ppi_obj.ppi_score,
-            "calculated_at": ppi_obj.calculated_at,
+            "employee_id": ppi.employee_id,
+            "review_cycle_id": ppi.review_cycle_id,
+            "current_cycle_score": ppi.current_cycle_score,
+            "previous_cycle_score_1": ppi.previous_cycle_score_1,
+            "previous_cycle_score_2": ppi.previous_cycle_score_2,
+            "ppi_score": ppi.ppi_score
         })

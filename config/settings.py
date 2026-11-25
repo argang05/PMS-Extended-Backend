@@ -1,7 +1,7 @@
 from pathlib import Path
 from dotenv import load_dotenv
 import os
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, unquote
 from datetime import timedelta
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -71,12 +71,16 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
-tmpPostgres = urlsplit(os.getenv("DATABASE_URL"))
-db_name = tmpPostgres.path[1:]
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is missing from environment variables.")
+
+tmpPostgres = urlsplit(DATABASE_URL)
+db_name = unquote(tmpPostgres.path.lstrip("/"))
 db_host = tmpPostgres.hostname
 db_port = tmpPostgres.port
-db_user = tmpPostgres.username
-db_password = tmpPostgres.password
+db_user = unquote(tmpPostgres.username) if tmpPostgres.username else None
+db_password = unquote(tmpPostgres.password) if tmpPostgres.password else None
 
 DATABASES = {
     "default": {

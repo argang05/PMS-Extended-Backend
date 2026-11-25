@@ -1,10 +1,12 @@
 from django.urls import path
-
 from .views import (
     AdminDashboardView,
     AdminQuestionCategoryListView,
     AdminQuestionListCreateView,
     AdminQuestionDetailView,
+    AdminQuestionBulkCreateView,
+    AdminQuestionTargetingPreviewView,
+    AdminQuestionTargetingOptionsView,
     AdminPotentialQuestionListCreateView,
     AdminPotentialQuestionDetailView,
     AdminScoreConfigurationListCreateView,
@@ -21,13 +23,28 @@ from .views import (
     EmployeeResetPreviewView,
     EmployeeResetExecuteView,
     AdminReviewCycleListView,
+    AdminQuestionnaireListCreateView,
+    AdminQuestionnaireDetailView,
+    AdminQuestionnaireGenerateView,
+    AdminQuestionnaireIncludeView,
+    AdminQuestionnaireExcludeView,
+    AdminQuestionnaireReorderView,
+    AdminQuestionnaireWeightageView,
+    AdminQuestionnaireResetView,
+    AdminQuestionnaireCopyView,
+    AdminQuestionnairePublishView,
 )
+from .views.question_bulk_views import AdminQuestionBulkUpdateView
 
 urlpatterns = [
     path("dashboard/", AdminDashboardView.as_view(), name="admin_dashboard"),
 
     path("question-categories/", AdminQuestionCategoryListView.as_view(), name="admin_question_categories"),
     path("questions/", AdminQuestionListCreateView.as_view(), name="admin_questions"),
+    path("questions/bulk-create/", AdminQuestionBulkCreateView.as_view(), name="admin_questions_bulk_create"),
+    path("questions/bulk-update/", AdminQuestionBulkUpdateView.as_view(), name="admin_questions_bulk_update"),
+    path("questions/targeting-preview/", AdminQuestionTargetingPreviewView.as_view(), name="admin_questions_targeting_preview"),
+    path("questions/targeting-options/", AdminQuestionTargetingOptionsView.as_view(), name="admin_questions_targeting_options"),
     path("questions/<int:question_id>/", AdminQuestionDetailView.as_view(), name="admin_question_detail"),
 
     path("potential-questions/", AdminPotentialQuestionListCreateView.as_view(), name="admin_potential_questions"),
@@ -42,13 +59,23 @@ urlpatterns = [
     path("config/potential/<int:config_id>/activate/", AdminPotentialConfigurationActivateView.as_view(), name="admin_potential_configuration_activate"),
 
     path("config/appraisal/", AdminAppraisalConfigurationListCreateView.as_view(), name="admin_appraisal_configurations"),
-    path("config/appraisal/<int:config_id>/", AdminAppraisalConfigurationDetailView.as_view(), name="admin_appraisal_configuration_detail"),
 
     path("cycles/", AdminReviewCycleListCreateView.as_view(), name="admin_review_cycles"),
     path("cycles/<int:cycle_id>/", AdminReviewCycleDetailView.as_view(), name="admin_review_cycle_detail"),
     path("cycles/<int:cycle_id>/activate/", AdminReviewCycleActivateView.as_view(), name="admin_review_cycle_activate"),
-    path("reset/preview/", EmployeeResetPreviewView.as_view()),
-    path("reset/execute/", EmployeeResetExecuteView.as_view()),
     path("cycles/list/", AdminReviewCycleListView.as_view()),
 
+    path("reset/preview/", EmployeeResetPreviewView.as_view()),
+    path("reset/execute/", EmployeeResetExecuteView.as_view()),
+
+    path("questionnaires/", AdminQuestionnaireListCreateView.as_view(), name="admin_questionnaires"),
+    path("questionnaires/copy/", AdminQuestionnaireCopyView.as_view(), name="admin_questionnaire_copy"),
+    path("questionnaires/<int:questionnaire_id>/", AdminQuestionnaireDetailView.as_view(), name="admin_questionnaire_detail"),
+    path("questionnaires/<int:questionnaire_id>/generate/", AdminQuestionnaireGenerateView.as_view(), name="admin_questionnaire_generate"),
+    path("questionnaires/<int:questionnaire_id>/include/", AdminQuestionnaireIncludeView.as_view(), name="admin_questionnaire_include"),
+    path("questionnaires/<int:questionnaire_id>/exclude/", AdminQuestionnaireExcludeView.as_view(), name="admin_questionnaire_exclude"),
+    path("questionnaires/<int:questionnaire_id>/reorder/", AdminQuestionnaireReorderView.as_view(), name="admin_questionnaire_reorder"),
+    path("questionnaires/<int:questionnaire_id>/items/<int:item_id>/weightage/", AdminQuestionnaireWeightageView.as_view(), name="admin_questionnaire_weightage"),
+    path("questionnaires/<int:questionnaire_id>/reset/", AdminQuestionnaireResetView.as_view(), name="admin_questionnaire_reset"),
+    path("questionnaires/<int:questionnaire_id>/publish/", AdminQuestionnairePublishView.as_view(), name="admin_questionnaire_publish"),
 ]
