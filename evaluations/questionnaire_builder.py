@@ -57,7 +57,7 @@ def _editable(questionnaire):
 
 def _lock(questionnaire_id):
     questionnaire = get_object_or_404(
-        EmployeeQuestionnaire.objects.select_for_update().select_related("employee", "review_cycle"),
+        EmployeeQuestionnaire.objects.select_for_update(of=("self",)).select_related("employee", "review_cycle"),
         id=questionnaire_id
     )
     _editable(questionnaire)
@@ -145,6 +145,42 @@ def applicable_questions(employee):
             legacy_performance.append(question)
     return legacy_behavioral[:5] + legacy_performance[:5] + targeted
 
+def _initialize_untouched_questionnaire_locked(questionnaire):
+    if questionnaire.status != "draft" or questionnaire.submitted_at:
+        return 0
+    if questionnaire.items.exists():
+        return 0
+    if EmployeeQuestionnaireCustomization.objects.filter(employee_questionnaire=questionnaire).exists():
+        return 0
+    if EmployeeQuestionnaireStageSubmission.objects.filter(employee_questionnaire=questionnaire).exists():
+        return 0
+    questions = applicable_questions(questionnaire.employee)
+    if not questions:
+        return 0
+    items = [
+        EmployeeQuestionnaireItem(
+            employee_questionnaire=questionnaire,
+            parameter=question,
+            weightage=question.default_weightage,
+            order=index,
+            source="automatic",
+            **_snapshot(question)
+        )
+        for index, question in enumerate(questions, 1)
+    ]
+    EmployeeQuestionnaireItem.objects.bulk_create(items)
+    return len(items)
+
+@transaction.atomic
+def ensure_questionnaire_initialized(questionnaire_id):
+    questionnaire = get_object_or_404(
+        EmployeeQuestionnaire.objects.select_for_update(of=("self",))
+        .select_related("employee", "review_cycle"),
+        id=questionnaire_id
+    )
+    _initialize_untouched_questionnaire_locked(questionnaire)
+    return questionnaire
+
 def _customizations(questionnaire):
     return {
         item.parameter_id: item.action
@@ -194,9 +230,11 @@ def _sync_locked(questionnaire, preserve_manual=True):
 
 @transaction.atomic
 def create_or_get_questionnaire(employee, review_cycle):
-    return EmployeeQuestionnaire.objects.get_or_create(
+    questionnaire, created = EmployeeQuestionnaire.objects.get_or_create(
         employee=employee, review_cycle=review_cycle, defaults={"status": "draft"}
     )
+    questionnaire = ensure_questionnaire_initialized(questionnaire.pk)
+    return questionnaire, created
 
 @transaction.atomic
 def generate_questionnaire(questionnaire_id):

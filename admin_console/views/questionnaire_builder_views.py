@@ -13,7 +13,8 @@ from evaluations.questionnaire_builder import (
     generate_questionnaire, include_question, exclude_question,
     reorder_questions, update_item_weightage,
     reset_questionnaire_customizations, copy_questionnaire,
-    publish_questionnaire, questionnaire_details, _editable, _self_review_submitted
+    publish_questionnaire, questionnaire_details, _editable,
+    _self_review_submitted, ensure_questionnaire_initialized
 )
 
 Employee = get_user_model()
@@ -41,11 +42,9 @@ class AdminQuestionnaireListCreateView(AdminBuilderBaseView):
         employee_number = request.query_params.get("employee_number", "").strip()
         status_filter = request.query_params.get("status", "").strip()
         published = request.query_params.get("is_published", "").strip()
-
         queryset = EmployeeQuestionnaire.objects.select_related(
             "employee", "review_cycle"
         ).order_by("-id")
-
         if cycle_id:
             queryset = queryset.filter(review_cycle_id=cycle_id)
         if employee_number:
@@ -54,13 +53,11 @@ class AdminQuestionnaireListCreateView(AdminBuilderBaseView):
             queryset = queryset.filter(status=status_filter)
         if published.lower() in ["true", "false"]:
             queryset = queryset.filter(is_published=published.lower() == "true")
-
         questionnaires = list(queryset)
         submitted_ids = set(EmployeeQuestionnaireStageSubmission.objects.filter(
             employee_questionnaire_id__in=[q.id for q in questionnaires],
             status="submitted"
         ).values_list("employee_questionnaire_id", flat=True))
-
         results = []
         for q in questionnaires:
             self_submitted = _self_review_submitted(q)
@@ -87,23 +84,25 @@ class AdminQuestionnaireListCreateView(AdminBuilderBaseView):
         cycle_id = request.data.get("cycle_id")
         if not employee_number or not cycle_id:
             return Response({"error": "employee_number and cycle_id are required."}, status=400)
-
         employee = get_object_or_404(Employee, employee_number=employee_number)
         cycle = get_object_or_404(ReviewCycle, id=cycle_id)
-        questionnaire, created = create_or_get_questionnaire(employee, cycle)
-        return Response({
-            "message": "Questionnaire created." if created else "Questionnaire already exists.",
-            "created": created,
-            "questionnaire": questionnaire_details(questionnaire)
-        }, status=201 if created else 200)
+
+        def operation():
+            questionnaire, created = create_or_get_questionnaire(employee, cycle)
+            return Response({
+                "message": "Questionnaire created." if created else "Questionnaire already exists.",
+                "created": created,
+                "questionnaire": questionnaire_details(questionnaire)
+            }, status=201 if created else 200)
+
+        return self.execute(operation)
 
 class AdminQuestionnaireDetailView(AdminBuilderBaseView):
     def get(self, request, questionnaire_id):
-        questionnaire = get_object_or_404(
-            EmployeeQuestionnaire.objects.select_related("employee", "review_cycle"),
-            id=questionnaire_id
-        )
-        return Response(questionnaire_details(questionnaire))
+        def operation():
+            questionnaire = ensure_questionnaire_initialized(questionnaire_id)
+            return Response(questionnaire_details(questionnaire))
+        return self.execute(operation)
 
 class AdminQuestionnaireGenerateView(AdminBuilderBaseView):
     def post(self, request, questionnaire_id):
@@ -130,7 +129,6 @@ class AdminQuestionnaireIncludeView(AdminBuilderBaseView):
                     return Response({"error": "question_id must be a positive integer."}, status=400)
                 if isinstance(question_id, bool) or parsed_id <= 0 or str(question_id).strip() != str(parsed_id):
                     return Response({"error": "question_id must be a positive integer."}, status=400)
-
                 already_assigned = EmployeeQuestionnaireItem.objects.filter(
                     employee_questionnaire=questionnaire, parameter_id=parsed_id
                 ).exists()
@@ -138,7 +136,6 @@ class AdminQuestionnaireIncludeView(AdminBuilderBaseView):
                     return Response({
                         "error": f"Question #{parsed_id} is already assigned to this employee's questionnaire."
                     }, status=409)
-
                 item = include_question(
                     questionnaire_id, parsed_id, request.user, request.data.get("weightage")
                 )
@@ -177,6 +174,7 @@ class AdminQuestionnaireWeightageView(AdminBuilderBaseView):
                 "item_id": item.id,
                 "weightage": item.weightage
             })
+
         return self.execute(operation)
 
 class AdminQuestionnaireResetView(AdminBuilderBaseView):
