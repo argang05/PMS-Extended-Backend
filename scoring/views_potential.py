@@ -1,433 +1,192 @@
+from django.db import transaction
 from django.shortcuts import get_object_or_404
-from django.utils import timezone
-
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-
-from evaluations.models import EmployeeQuestionnaire
-from .models import (
-    PotentialParameter,
-    PotentialScoreConfiguration,
-    EmployeePotentialAssessment,
-    EmployeePotentialResponse,
-    EmployeePotentialScore,
-    EmployeePerformanceScore,
-    EmployeePastPerformanceIndex,
+from rest_framework.exceptions import ValidationError, PermissionDenied
+from .models import EmployeePotentialScore
+from .scoring_locks import lock_potential_assessment
+from .services_potential import get_active_potential_config, calculate_weighted_potential_score, save_potential_score, serialize_potential_score
+from .potential_evaluation.services import (
+    manager_assessment_queryset, get_assessment, resolve_evaluator,
+    evaluator_can_submit, evaluator_has_submitted, required_evaluators,
+    evaluation_is_complete, get_assessment_items, materialize_legacy_items,
+    build_evaluation_detail, save_evaluation, positive_id, is_legacy_assessment
 )
 
-
 def is_scoring_admin(user):
-    return str(getattr(user, "employee_number", "")) == "100607"
+    return user.is_authenticated and user.is_active and str(getattr(user, "employee_number", "")) == "100607"
 
+def _require_active_user(user):
+    if not user.is_authenticated or not user.is_active:
+        raise PermissionDenied("An active employee account is required.")
 
-def get_active_potential_config():
-    return PotentialScoreConfiguration.objects.filter(is_active=True).first()
+def _require_evaluator(assessment, user, evaluator):
+    _require_active_user(user)
+    if resolve_evaluator(assessment, user) != evaluator:
+        raise PermissionDenied("You are not authorized for this evaluation stage.")
 
+def _pending_assessments(user, evaluator):
+    _require_active_user(user)
+    queryset = manager_assessment_queryset(user)
+    if evaluator == "rm":
+        queryset = queryset.filter(reporting_manager_id=user.pk)
+    else:
+        queryset = queryset.filter(skip_level_manager_id=user.pk, rm_submitted=True)
+    return [{
+        "assessment_id": assessment.pk,
+        "questionnaire_id": assessment.employee_questionnaire_id,
+        "employee_questionnaire_id": assessment.employee_questionnaire_id,
+        "employee_name": assessment.employee.full_name,
+        "employee_number": assessment.employee.employee_number,
+        "department": assessment.employee.department,
+        "cycle": assessment.review_cycle.name if assessment.review_cycle else None,
+        "review_cycle_id": assessment.review_cycle_id,
+        "status": assessment.status,
+        "rm_submitted": assessment.rm_submitted,
+        "skip_submitted": assessment.skip_submitted,
+        "skip_required": "skip" in required_evaluators(assessment),
+        "evaluation_complete": evaluation_is_complete(assessment),
+        "is_published": assessment.is_published,
+        "question_count": assessment.question_count,
+        "can_evaluate": evaluator_can_submit(assessment, evaluator) and (
+            assessment.question_count > 0 or is_legacy_assessment(assessment)
+        ),
+        "is_submitted": evaluator_has_submitted(assessment, evaluator),
+        "requires_preparation": assessment.question_count == 0 and is_legacy_assessment(assessment)
+            and evaluator_can_submit(assessment, evaluator),
+        "revision": assessment.updated_at.isoformat()
+    } for assessment in queryset]
 
-def calculate_weighted_potential_score(responses):
-    total_weight = 0
-    weighted_sum = 0
+@transaction.atomic
+def _evaluation_form(assessment_id, user, evaluator):
+    assessment = get_assessment(assessment_id, lock=True)
+    _require_evaluator(assessment, user, evaluator)
+    if evaluator == "skip" and not assessment.rm_submitted:
+        raise ValidationError("The Reporting Manager must complete the evaluation first.")
+    items = get_assessment_items(assessment)
+    if not items and evaluator_can_submit(assessment, evaluator) and is_legacy_assessment(assessment):
+        items = materialize_legacy_items(assessment)
+    detail = build_evaluation_detail(assessment, evaluator, items)
+    responses = detail["responses"]
+    return {
+        "assessment_id": assessment.pk,
+        "questionnaire_id": assessment.employee_questionnaire_id,
+        "employee_questionnaire_id": assessment.employee_questionnaire_id,
+        "employee_name": assessment.employee.full_name,
+        "employee_number": assessment.employee.employee_number,
+        "department": assessment.employee.department,
+        "cycle": assessment.review_cycle.name if assessment.review_cycle else None,
+        "review_cycle_id": assessment.review_cycle_id,
+        "status": detail["status"],
+        "evaluator_type": evaluator,
+        "is_published": detail["is_published"],
+        "is_submitted": detail["is_submitted"],
+        "can_evaluate": detail["can_evaluate"],
+        "rm_submitted": detail["rm_submitted"],
+        "skip_submitted": detail["skip_submitted"],
+        "skip_required": detail["skip_required"],
+        "required_evaluators": detail["required_evaluators"],
+        "evaluation_complete": detail["evaluation_complete"],
+        "question_count": detail["question_count"],
+        "objective_count": detail["objective_count"],
+        "descriptive_count": detail["descriptive_count"],
+        "requires_preparation": detail["requires_preparation"],
+        "revision": detail["revision"],
+        "questions": detail["questions"],
+        "responses": {response["parameter_id"]: response["score"] for response in responses},
+        "descriptive_responses": {
+            response["parameter_id"]: response["descriptive_answer"]
+            for response in responses if response["descriptive_answer"] is not None
+        },
+        "response_details": responses
+    }
 
-    for r in responses:
-        weight = r.parameter.weightage
-        weighted_sum += r.score * weight
-        total_weight += weight
+def _save_evaluation(user, evaluator, payload, submit=False):
+    _require_active_user(user)
+    assessment_id = positive_id(payload.get("assessment_id"), "assessment_id")
+    detail = save_evaluation(
+        assessment_id=assessment_id, user=user,
+        responses=payload.get("responses", []),
+        revision=payload.get("revision"), submit=submit,
+        expected_evaluator=evaluator, allow_legacy_preparation=True
+    )
+    label = "RM" if evaluator == "rm" else "Skip"
+    return {
+        "message": f"{label} potential questionnaire submitted." if submit else f"{label} potential draft saved.",
+        "assessment_id": detail["assessment_id"],
+        "status": detail["status"],
+        "rm_submitted": detail["rm_submitted"],
+        "skip_submitted": detail["skip_submitted"],
+        "skip_required": detail["skip_required"],
+        "evaluation_complete": detail["evaluation_complete"],
+        "revision": detail["revision"],
+        "is_submitted": detail["is_submitted"],
+        "changed": detail["changed"]
+    }
 
-    if total_weight == 0:
-        return None
-
-    return round(weighted_sum / total_weight, 2)
-
-
-class RMPotentialPendingView(APIView):
+class PotentialAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
+class RMPotentialPendingView(PotentialAPIView):
     def get(self, request):
-        questionnaires = (
-            EmployeeQuestionnaire.objects
-            .select_related("employee", "review_cycle")
-            .filter(employee__reporting_manager=request.user)
-            .order_by("-id")
-        )
+        return Response({"results": _pending_assessments(request.user, "rm")})
 
-        results = []
-
-        for q in questionnaires:
-            assessment, _ = EmployeePotentialAssessment.objects.get_or_create(
-                employee=q.employee,
-                review_cycle=q.review_cycle,
-                employee_questionnaire=q,
-                defaults={
-                    "status": "pending_rm"
-                }
-            )
-
-            results.append({
-                "assessment_id": assessment.id,
-                "questionnaire_id": q.id,
-                "employee_name": q.employee.full_name,
-                "employee_number": q.employee.employee_number,
-                "department": q.employee.department,
-                "cycle": q.review_cycle.name if q.review_cycle else None,
-                "status": assessment.status,
-                "rm_submitted": assessment.rm_submitted,
-                "skip_submitted": assessment.skip_submitted,
-            })
-
-        return Response({"results": results})
-
-
-class SkipPotentialPendingView(APIView):
-    permission_classes = [IsAuthenticated]
-
+class SkipPotentialPendingView(PotentialAPIView):
     def get(self, request):
-        questionnaires = (
-            EmployeeQuestionnaire.objects
-            .select_related("employee", "review_cycle")
-            .filter(employee__skip_level_manager=request.user)
-            .order_by("-id")
-        )
+        return Response({"results": _pending_assessments(request.user, "skip")})
 
-        results = []
-
-        for q in questionnaires:
-            assessment, _ = EmployeePotentialAssessment.objects.get_or_create(
-                employee=q.employee,
-                review_cycle=q.review_cycle,
-                employee_questionnaire=q,
-                defaults={
-                    "status": "pending_rm"
-                }
-            )
-
-            # Skip should only work after RM potential is submitted
-            if not assessment.rm_submitted:
-                continue
-
-            results.append({
-                "assessment_id": assessment.id,
-                "questionnaire_id": q.id,
-                "employee_name": q.employee.full_name,
-                "employee_number": q.employee.employee_number,
-                "department": q.employee.department,
-                "cycle": q.review_cycle.name if q.review_cycle else None,
-                "status": assessment.status,
-                "rm_submitted": assessment.rm_submitted,
-                "skip_submitted": assessment.skip_submitted,
-            })
-
-        return Response({"results": results})
-
-
-class RMPotentialFormView(APIView):
-    permission_classes = [IsAuthenticated]
-
+class RMPotentialFormView(PotentialAPIView):
     def get(self, request, assessment_id):
-        assessment = get_object_or_404(
-            EmployeePotentialAssessment.objects.select_related("employee"),
-            id=assessment_id
-        )
+        return Response(_evaluation_form(assessment_id, request.user, "rm"))
 
-        if assessment.employee.reporting_manager != request.user:
-            return Response({"error": "Not authorized."}, status=403)
-
-        parameters = PotentialParameter.objects.filter(is_active=True).order_by("id")
-
-        questions = [
-            {
-                "parameter_id": p.id,
-                "question_text": p.question_text,
-                "weightage": p.weightage,
-            }
-            for p in parameters
-        ]
-
-        existing = EmployeePotentialResponse.objects.filter(
-            assessment=assessment,
-            evaluator_type="rm"
-        )
-
-        existing_map = {r.parameter_id: r.score for r in existing}
-
-        return Response({
-            "assessment_id": assessment.id,
-            "employee_name": assessment.employee.full_name,
-            "department": assessment.employee.department,
-            "questions": questions,
-            "responses": existing_map,
-        })
-
-
-class SkipPotentialFormView(APIView):
-    permission_classes = [IsAuthenticated]
-
+class SkipPotentialFormView(PotentialAPIView):
     def get(self, request, assessment_id):
-        assessment = get_object_or_404(
-            EmployeePotentialAssessment.objects.select_related("employee"),
-            id=assessment_id
-        )
+        return Response(_evaluation_form(assessment_id, request.user, "skip"))
 
-        if assessment.employee.skip_level_manager != request.user:
-            return Response({"error": "Not authorized."}, status=403)
-
-        parameters = PotentialParameter.objects.filter(is_active=True).order_by("id")
-
-        questions = [
-            {
-                "parameter_id": p.id,
-                "question_text": p.question_text,
-                "weightage": p.weightage,
-            }
-            for p in parameters
-        ]
-
-        existing = EmployeePotentialResponse.objects.filter(
-            assessment=assessment,
-            evaluator_type="skip"
-        )
-
-        existing_map = {r.parameter_id: r.score for r in existing}
-
-        return Response({
-            "assessment_id": assessment.id,
-            "employee_name": assessment.employee.full_name,
-            "department": assessment.employee.department,
-            "questions": questions,
-            "responses": existing_map,
-        })
-
-
-class RMSavePotentialDraftView(APIView):
-    permission_classes = [IsAuthenticated]
-
+class RMSavePotentialDraftView(PotentialAPIView):
     def post(self, request):
-        assessment_id = request.data.get("assessment_id")
-        responses = request.data.get("responses", [])
+        return Response(_save_evaluation(request.user, "rm", request.data))
 
-        assessment = get_object_or_404(
-            EmployeePotentialAssessment.objects.select_related("employee"),
-            id=assessment_id
-        )
-
-        if assessment.employee.reporting_manager != request.user:
-            return Response({"error": "Not authorized."}, status=403)
-
-        for r in responses:
-            parameter = get_object_or_404(PotentialParameter, id=r["parameter_id"])
-
-            EmployeePotentialResponse.objects.update_or_create(
-                assessment=assessment,
-                parameter=parameter,
-                evaluator_type="rm",
-                defaults={"score": r["score"]}
-            )
-
-        return Response({"message": "RM potential draft saved."})
-
-
-class SkipSavePotentialDraftView(APIView):
-    permission_classes = [IsAuthenticated]
-
+class SkipSavePotentialDraftView(PotentialAPIView):
     def post(self, request):
-        assessment_id = request.data.get("assessment_id")
-        responses = request.data.get("responses", [])
+        return Response(_save_evaluation(request.user, "skip", request.data))
 
-        assessment = get_object_or_404(
-            EmployeePotentialAssessment.objects.select_related("employee"),
-            id=assessment_id
-        )
-
-        if assessment.employee.skip_level_manager != request.user:
-            return Response({"error": "Not authorized."}, status=403)
-
-        for r in responses:
-            parameter = get_object_or_404(PotentialParameter, id=r["parameter_id"])
-
-            EmployeePotentialResponse.objects.update_or_create(
-                assessment=assessment,
-                parameter=parameter,
-                evaluator_type="skip",
-                defaults={"score": r["score"]}
-            )
-
-        return Response({"message": "Skip potential draft saved."})
-
-
-class RMSubmitPotentialView(APIView):
-    permission_classes = [IsAuthenticated]
-
+class RMSubmitPotentialView(PotentialAPIView):
     def post(self, request):
-        assessment_id = request.data.get("assessment_id")
-        responses = request.data.get("responses", [])
+        return Response(_save_evaluation(request.user, "rm", request.data, submit=True))
 
-        assessment = get_object_or_404(
-            EmployeePotentialAssessment.objects.select_related("employee"),
-            id=assessment_id
-        )
-
-        if assessment.employee.reporting_manager != request.user:
-            return Response({"error": "Not authorized."}, status=403)
-
-        for r in responses:
-            parameter = get_object_or_404(PotentialParameter, id=r["parameter_id"])
-
-            EmployeePotentialResponse.objects.update_or_create(
-                assessment=assessment,
-                parameter=parameter,
-                evaluator_type="rm",
-                defaults={"score": r["score"]}
-            )
-
-        assessment.rm_submitted = True
-
-        if assessment.employee.skip_level_manager:
-            assessment.status = "pending_skip"
-        else:
-            assessment.status = "completed"
-
-        assessment.save()
-
-        return Response({"message": "RM potential questionnaire submitted."})
-
-
-class SkipSubmitPotentialView(APIView):
-    permission_classes = [IsAuthenticated]
-
+class SkipSubmitPotentialView(PotentialAPIView):
     def post(self, request):
-        assessment_id = request.data.get("assessment_id")
-        responses = request.data.get("responses", [])
+        return Response(_save_evaluation(request.user, "skip", request.data, submit=True))
 
-        assessment = get_object_or_404(
-            EmployeePotentialAssessment.objects.select_related("employee"),
-            id=assessment_id
-        )
-
-        if assessment.employee.skip_level_manager != request.user:
-            return Response({"error": "Not authorized."}, status=403)
-
-        for r in responses:
-            parameter = get_object_or_404(PotentialParameter, id=r["parameter_id"])
-
-            EmployeePotentialResponse.objects.update_or_create(
-                assessment=assessment,
-                parameter=parameter,
-                evaluator_type="skip",
-                defaults={"score": r["score"]}
-            )
-
-        assessment.skip_submitted = True
-        assessment.status = "completed"
-        assessment.save()
-
-        return Response({"message": "Skip potential questionnaire submitted."})
-
-
-class CalculatePotentialScoreView(APIView):
-    permission_classes = [IsAuthenticated]
-
+class CalculatePotentialScoreView(PotentialAPIView):
     def post(self, request, assessment_id):
         if not is_scoring_admin(request.user):
             return Response({"error": "Not authorized."}, status=403)
-
-        assessment = get_object_or_404(
-            EmployeePotentialAssessment.objects.select_related("employee", "review_cycle", "employee_questionnaire"),
-            id=assessment_id
-        )
-
-        if not assessment.rm_submitted:
-            return Response(
-                {"error": "RM potential questionnaire must be submitted first."},
-                status=400
-            )
-
-        if assessment.employee.skip_level_manager and not assessment.skip_submitted:
-            return Response(
-                {"error": "Skip potential questionnaire must be submitted first."},
-                status=400
-            )
-
-        config = get_active_potential_config()
-        if not config:
-            return Response(
-                {"error": "No active potential score configuration found."},
-                status=400
-            )
-
-        rm_responses = EmployeePotentialResponse.objects.filter(
-            assessment=assessment,
-            evaluator_type="rm"
-        ).select_related("parameter")
-
-        rm_score = calculate_weighted_potential_score(rm_responses)
-
-        skip_score = None
-        final_potential_score = None
-
-        if assessment.employee.skip_level_manager:
-            skip_responses = EmployeePotentialResponse.objects.filter(
-                assessment=assessment,
-                evaluator_type="skip"
-            ).select_related("parameter")
-
-            skip_score = calculate_weighted_potential_score(skip_responses)
-
-            final_potential_score = round(
-                (rm_score * config.rm_weight) +
-                (skip_score * config.skip_weight),
-                2
-            )
-        else:
-            final_potential_score = rm_score
-
-        score_obj, _ = EmployeePotentialScore.objects.update_or_create(
-            employee=assessment.employee,
-            review_cycle=assessment.review_cycle,
-            employee_questionnaire=assessment.employee_questionnaire,
-            defaults={
-                "rm_score": rm_score,
-                "skip_score": skip_score,
-                "final_potential_score": final_potential_score,
-            }
-        )
-
+        assessment, score, changed, invalidation = save_potential_score(assessment_id, request.user)
         return Response({
             "message": "Potential score calculated successfully.",
-            "assessment_id": assessment.id,
-            "employee_name": assessment.employee.full_name,
-            "review_cycle": assessment.review_cycle.name if assessment.review_cycle else None,
-            "rm_score": score_obj.rm_score,
-            "skip_score": score_obj.skip_score,
-            "final_potential_score": score_obj.final_potential_score,
+            **serialize_potential_score(assessment, score),
+            "changed": changed, "invalidation": invalidation
         })
 
-
-class PotentialResultView(APIView):
-    permission_classes = [IsAuthenticated]
-
+class PotentialResultView(PotentialAPIView):
+    @transaction.atomic
     def get(self, request, assessment_id):
         if not is_scoring_admin(request.user):
             return Response({"error": "Not authorized."}, status=403)
-
-        assessment = get_object_or_404(
-            EmployeePotentialAssessment.objects.select_related("employee", "review_cycle", "employee_questionnaire"),
-            id=assessment_id
-        )
-
-        score_obj = get_object_or_404(
+        questionnaire, assessment = lock_potential_assessment(assessment_id)
+        score = get_object_or_404(
             EmployeePotentialScore,
-            employee=assessment.employee,
-            review_cycle=assessment.review_cycle,
-            employee_questionnaire=assessment.employee_questionnaire,
+            employee_id=assessment.employee_id,
+            review_cycle_id=assessment.review_cycle_id,
+            employee_questionnaire_id=questionnaire.pk
         )
-
+        from .score_readiness import get_potential_readiness
+        readiness = get_potential_readiness(questionnaire, score=score)
         return Response({
-            "assessment_id": assessment.id,
-            "employee_name": assessment.employee.full_name,
-            "employee_number": assessment.employee.employee_number,
-            "review_cycle": assessment.review_cycle.name if assessment.review_cycle else None,
-            "rm_score": score_obj.rm_score,
-            "skip_score": score_obj.skip_score,
-            "final_potential_score": score_obj.final_potential_score,
-            "calculated_at": score_obj.calculated_at,
+            **serialize_potential_score(assessment, score),
+            "is_current": readiness["is_current"],
+            "missing_requirements": readiness["missing_requirements"]
         })

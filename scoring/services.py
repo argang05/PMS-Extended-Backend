@@ -1,8 +1,13 @@
 from collections import defaultdict
 from math import isfinite
 from django.core.exceptions import ValidationError
-from evaluations.models import EmployeeQuestionnaireItem, EmployeeQuestionnaireStageSubmission, EmployeeQuestionnaireResponse
+from evaluations.models import (
+    EmployeeQuestionnaireItem,
+    EmployeeQuestionnaireStageSubmission,
+    EmployeeQuestionnaireResponse
+)
 from .models import ScoreConfiguration
+from .descriptive_preference import is_descriptive_scoring_enabled
 
 EVALUATORS = ("self", "rm", "skip", "peer")
 CATEGORIES = ("behavioural", "performance")
@@ -61,7 +66,10 @@ def weighted_category_score(responses):
 def calculate_evaluator_score(behavioural, performance, config):
     if behavioural is None or performance is None:
         return None
-    return round(behavioural * config.behavioural_weight + performance * config.performance_weight, 2)
+    return round(
+        behavioural * config.behavioural_weight +
+        performance * config.performance_weight, 2
+    )
 
 
 def normalize_weights(active_evaluators, config):
@@ -77,7 +85,10 @@ def normalize_weights(active_evaluators, config):
 
 
 def calculate_final_score(scores, weights):
-    return round(sum(score * weights[e] for e, score in scores.items() if score is not None and e in weights), 2)
+    return round(sum(
+        score * weights[e] for e, score in scores.items()
+        if score is not None and e in weights
+    ), 2)
 
 
 def _validate_config(config):
@@ -89,13 +100,14 @@ def _validate_config(config):
     for group in groups:
         numbers = [_number(value, "Configuration weight") for value in group]
         if any(not 0 <= value <= 1 for value in numbers) or abs(sum(numbers) - 1) > 1e-6:
-            raise ValidationError("Scoring configuration weights must be between 0 and 1 and each group must total 1.")
+            raise ValidationError(
+                "Scoring configuration weights must be between 0 and 1 and each group must total 1."
+            )
 
 
 def _skip_required(questionnaire):
     manager = questionnaire.employee.reporting_manager
-    exempt = str(getattr(manager, "band", "") or "").upper().startswith("SM")
-    return not exempt
+    return not str(getattr(manager, "band", "") or "").upper().startswith("SM")
 
 
 def _peer_ids(questionnaire):
@@ -119,10 +131,10 @@ def _item_map(questionnaire):
         component, category = _question_type(item), _category_type(item)
         weight = _number(item.weightage, "Question weight")
         maximum = _number(_max_marks(item), "Maximum marks")
-
         if component not in COMPONENTS or category not in CATEGORIES or weight <= 0 or maximum <= 0:
-            raise ValidationError(f"Invalid classification, weight, or maximum marks on item {item.id}.")
-
+            raise ValidationError(
+                f"Invalid classification, weight, or maximum marks on item {item.id}."
+            )
         result[item.id] = (component, category, weight, maximum)
     return result
 
@@ -140,7 +152,10 @@ def _submission_scores(submission, item_map, descriptive_enabled):
         missing.append({"submission_id": submission.id, "reason": "Duplicate responses"})
 
     if set(by_item) - set(item_map):
-        missing.append({"submission_id": submission.id, "reason": "Responses to foreign questionnaire items"})
+        missing.append({
+            "submission_id": submission.id,
+            "reason": "Responses to foreign questionnaire items"
+        })
 
     groups = defaultdict(list)
 
@@ -148,26 +163,40 @@ def _submission_scores(submission, item_map, descriptive_enabled):
         response = by_item.get(item_id)
 
         if response is None:
-            missing.append({"submission_id": submission.id, "item_id": item_id, "reason": "Response missing"})
+            missing.append({
+                "submission_id": submission.id,
+                "item_id": item_id,
+                "reason": "Response missing"
+            })
             continue
 
         if response.reviewer_type != submission.evaluator_type:
-            missing.append({"submission_id": submission.id, "item_id": item_id, "reason": "Reviewer type mismatch"})
+            missing.append({
+                "submission_id": submission.id,
+                "item_id": item_id,
+                "reason": "Reviewer type mismatch"
+            })
             continue
 
         if response.is_not_applicable:
             if submission.evaluator_type != "peer" or response.score is not None or (response.descriptive_answer or "").strip():
-                missing.append({"submission_id": submission.id, "item_id": item_id, "reason": "Invalid N/A response"})
+                missing.append({
+                    "submission_id": submission.id,
+                    "item_id": item_id,
+                    "reason": "Invalid N/A response"
+                })
             continue
 
         if component == "descriptive":
             if not (response.descriptive_answer or "").strip():
-                missing.append({"submission_id": submission.id, "item_id": item_id, "reason": "Descriptive answer missing"})
+                missing.append({
+                    "submission_id": submission.id,
+                    "item_id": item_id,
+                    "reason": "Descriptive answer missing"
+                })
                 continue
-
             if not descriptive_enabled:
                 continue
-
             record = getattr(response, "admin_descriptive_score", None)
             raw = record.score if record else None
         else:
@@ -185,7 +214,11 @@ def _submission_scores(submission, item_map, descriptive_enabled):
         score = _number(raw, "Response score")
 
         if not 0 <= score <= maximum:
-            missing.append({"submission_id": submission.id, "item_id": item_id, "reason": "Score outside maximum marks"})
+            missing.append({
+                "submission_id": submission.id,
+                "item_id": item_id,
+                "reason": "Score outside maximum marks"
+            })
             continue
 
         groups[(component, category)].append((score * 10 / maximum, weight))
@@ -220,7 +253,7 @@ def calculate_questionnaire_scores(questionnaire, config=None):
     item_map = _item_map(questionnaire)
     peer_ids = _peer_ids(questionnaire)
     skip_required = _skip_required(questionnaire)
-    descriptive_enabled = bool(config.descriptive_scoring_enabled)
+    descriptive_enabled = is_descriptive_scoring_enabled(questionnaire)
 
     components_present = {component for component, _, _, _ in item_map.values()}
     required_components = ["objective"] + (
@@ -232,7 +265,9 @@ def calculate_questionnaire_scores(questionnaire, config=None):
 
     missing = []
     if not required_components:
-        missing.append({"reason": "No enabled scoring component exists in this questionnaire"})
+        missing.append({
+            "reason": "No enabled scoring component exists in this questionnaire"
+        })
 
     submissions = list(
         EmployeeQuestionnaireStageSubmission.objects.filter(
@@ -243,7 +278,6 @@ def calculate_questionnaire_scores(questionnaire, config=None):
     )
 
     selected = defaultdict(list)
-
     for submission in submissions:
         if submission.evaluator_type == "peer" and submission.submitted_by_id not in peer_ids:
             continue
@@ -262,7 +296,6 @@ def calculate_questionnaire_scores(questionnaire, config=None):
         missing.append({"evaluator": "peer", "reason": "No peer reviewer assigned"})
 
     submitted_peers = [s.submitted_by_id for s in selected["peer"]]
-
     for peer_id in sorted(peer_ids):
         if submitted_peers.count(peer_id) != 1:
             missing.append({
@@ -278,7 +311,6 @@ def calculate_questionnaire_scores(questionnaire, config=None):
 
     for evaluator in EVALUATORS:
         records = []
-
         for submission in selected[evaluator]:
             scores, errors = _submission_scores(submission, item_map, descriptive_enabled)
             missing.extend(errors)
@@ -290,8 +322,7 @@ def calculate_questionnaire_scores(questionnaire, config=None):
         for component in COMPONENTS:
             for category in CATEGORIES:
                 values = [
-                    record[component][category]
-                    for record in records
+                    record[component][category] for record in records
                     if record[component][category] is not None
                 ]
                 category_scores[f"{evaluator}_{category}_{component}"] = (
@@ -300,7 +331,6 @@ def calculate_questionnaire_scores(questionnaire, config=None):
 
             values = [_category_combined(record[component], config) for record in records]
             values = [value for value in values if value is not None]
-
             component_evaluator_scores[component][evaluator] = (
                 sum(values) / len(values) if values else None
             )
@@ -314,10 +344,8 @@ def calculate_questionnaire_scores(questionnaire, config=None):
         missing.append({"reason": "No positive active evaluator weights"})
 
     component_finals = {}
-
     for component in required_components:
         values = component_evaluator_scores[component]
-
         if any(values.get(evaluator) is None for evaluator in active if effective.get(evaluator, 0) > 0):
             missing.append({
                 "component": component,
@@ -326,8 +354,10 @@ def calculate_questionnaire_scores(questionnaire, config=None):
             component_finals[component] = None
         else:
             component_finals[component] = (
-                sum(values[evaluator] * effective[evaluator] for evaluator in active if effective.get(evaluator, 0) > 0)
-                if effective else None
+                sum(
+                    values[evaluator] * effective[evaluator]
+                    for evaluator in active if effective.get(evaluator, 0) > 0
+                ) if effective else None
             )
 
     objective = component_finals.get("objective")
@@ -349,8 +379,7 @@ def calculate_questionnaire_scores(questionnaire, config=None):
 
         if any(
             component_evaluator_scores[component].get(evaluator) is None
-            for component in required_components
-            if component_weights[component] > 0
+            for component in required_components if component_weights[component] > 0
         ):
             evaluator_scores[evaluator] = None
         else:
@@ -364,17 +393,23 @@ def calculate_questionnaire_scores(questionnaire, config=None):
             component: _category_combined(record[component], config)
             for component in required_components
         }
-
         value = (
-            sum(parts[component] * component_weights[component] for component in required_components)
-            if all(parts[component] is not None for component in required_components if component_weights[component] > 0)
-            else None
+            sum(
+                parts[component] * component_weights[component]
+                for component in required_components if component_weights[component] > 0
+            )
+            if all(
+                parts[component] is not None
+                for component in required_components if component_weights[component] > 0
+            ) else None
         )
-
         peer_individual_scores.append(round(value, 2) if value is not None else None)
 
     final = (
-        sum(component_finals[component] * component_weights[component] for component in required_components)
+        sum(
+            component_finals[component] * component_weights[component]
+            for component in required_components if component_weights[component] > 0
+        )
         if required_components and all(
             component_finals[component] is not None
             for component in required_components if component_weights[component] > 0

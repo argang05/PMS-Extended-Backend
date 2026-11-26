@@ -6,6 +6,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework import serializers
 from .models import EmployeeQuestionnaire, EmployeeQuestionnaireResponse
 from .descriptive_scoring import save_descriptive_score, save_descriptive_scores
+from scoring.descriptive_preference import is_descriptive_scoring_enabled
 
 
 def _is_admin(user):
@@ -38,6 +39,8 @@ class AdminDescriptiveResponsesView(APIView):
             pk=questionnaire_id
         )
 
+        descriptive_enabled = is_descriptive_scoring_enabled(questionnaire)
+
         responses = EmployeeQuestionnaireResponse.objects.filter(
             submission__employee_questionnaire=questionnaire,
             submission__status="submitted",
@@ -67,13 +70,16 @@ class AdminDescriptiveResponsesView(APIView):
 
             score_record = getattr(response, "admin_descriptive_score", None)
             submitted_by = response.submission.submitted_by
+            category = item.parameter.category
 
             results.append({
                 "response_id": response.id,
                 "item_id": item.id,
                 "question": item.question_text_snapshot or item.parameter.question_text,
-                "category": item.parameter.category.name,
-                "category_type": item.category_type_snapshot or item.parameter.category.category_type,
+                "category": category.name if category else None,
+                "category_type": item.category_type_snapshot or (
+                    category.category_type if category else None
+                ),
                 "weightage": item.weightage,
                 "max_marks": max_marks,
                 "evaluator_type": response.submission.evaluator_type,
@@ -87,13 +93,17 @@ class AdminDescriptiveResponsesView(APIView):
                 "scored_at": score_record.scored_at if score_record else None
             })
 
+        scored_count = sum(r["admin_score"] is not None for r in results)
+
         return Response({
             "questionnaire_id": questionnaire.id,
             "employee_name": questionnaire.employee.full_name,
             "review_cycle": questionnaire.review_cycle.name,
             "questionnaire_status": questionnaire.status,
+            "descriptive_scoring_enabled": descriptive_enabled,
             "total_descriptive_responses": len(results),
-            "scored_responses": sum(r["admin_score"] is not None for r in results),
+            "scored_responses": scored_count,
+            "pending_responses": len(results) - scored_count,
             "responses": results
         })
 
